@@ -1,0 +1,28 @@
+type: charm
+
+name: debarchive
+title: Debarchive Operator
+
+summary: Charm for installing and using debarchive with Landscape Server.
+description: |
+  Charm used for managing debarchive along with Landscape Server.
+
+platforms:
+  #ubuntu@22.04:amd64: TBD - Release for jammy as well?
+  #ubuntu@22.04:arm64:
+  ubuntu@24.04:amd64:
+  ubuntu@24.04:arm64:
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
+
+config: 
+  options:
+    server-port:
+      default: 8000
+      type: int
+      description: The port debarchive server will listen on.
