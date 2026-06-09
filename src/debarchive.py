@@ -3,7 +3,9 @@
 The intention is that this module could be used outside the context of a charm.
 """
 
+import base64
 import logging
+import secrets
 
 from charmlibs import snap
 
@@ -16,6 +18,7 @@ SNAPS_TO_INSTALL = [(DEBARCHIVE_SNAP_NAME, {"channel": "beta"})]
 def install() -> None:
     """Handle installing anything debarchive specific (e.g., temporal snap, etc,..)."""
     _install_snap_packages()
+    set_pagination_secret()
 
 
 def start() -> None:
@@ -37,7 +40,6 @@ def _install_snap_packages():
 
             if snap_name == DEBARCHIVE_SNAP_NAME:
                 snap_package.set({"deb.archive.server.host": "0.0.0.0"})
-                snap_package.restart()
 
             # TODO: if we want a specific revision of the snap (to match charm revisions to
             # snap revisions) handle here, then hold the package
@@ -62,7 +64,6 @@ def configure_database(
             "deb.archive.database.driver": "pgx",
         }
     )
-    debarchive_snap.restart()
 
 
 def get_version() -> str | None:
@@ -74,3 +75,27 @@ def get_version() -> str | None:
         return None
 
     return str(debarchive_snap.revision) if debarchive_snap.present else None
+
+
+def set_secret_token(content: dict[str, str]) -> None:
+    """Set the jwt secret token in the snap configuration."""
+    secret_token = content["secret-token"]
+    encoded_secret_token = base64.b64encode(secret_token.encode("utf-8")).decode("utf-8")
+    debarchive_snap = snap.SnapCache()[DEBARCHIVE_SNAP_NAME]
+    debarchive_snap.set(
+        {
+            "deb.archive.jwt.secret": encoded_secret_token,
+        }
+    )
+
+
+def set_pagination_secret() -> None:
+    """Set the pagination secret in the snap configuration."""
+    raw_bytes = secrets.token_bytes(32)
+    pagination_secret = base64.urlsafe_b64encode(raw_bytes).decode("utf-8")
+    debarchive_snap = snap.SnapCache()[DEBARCHIVE_SNAP_NAME]
+    debarchive_snap.set(
+        {
+            "deb.archive.pagination.secret": pagination_secret,
+        }
+    )
