@@ -8,10 +8,20 @@ from charmlibs import snap
 from charms.data_platform_libs.v0.data_interfaces import (
     DatabaseRequires,
 )
+from charms.haproxy.v1.haproxy_route import HaproxyRouteRequirer
+from ops.charm import (
+    RelationChangedEvent,
+    RelationJoinedEvent,
+)
+from ops.model import ModelError
 
 import debarchive
 
 logger = logging.getLogger(__name__)
+
+HAPROXY_ROUTE_RELATION = "debarchive-haproxy-route"
+DEBARCHIVE_ROUTE_PREFIX = "/debarchive"
+DEBARCHIVE_PATH_REWRITE = r"%[path,regsub(^/debarchive/?,/)]"
 
 
 class DebarchiveOperatorCharm(ops.CharmBase):
@@ -40,6 +50,33 @@ class DebarchiveOperatorCharm(ops.CharmBase):
             self.on.landscape_server_relation_changed, self._on_landscape_server_changed
         )
 
+        self.debarchive_haproxy_route = HaproxyRouteRequirer(
+            self, relation_name=HAPROXY_ROUTE_RELATION
+        )
+        framework.observe(
+            self.on[HAPROXY_ROUTE_RELATION].relation_joined,
+            self._on_haproxy_route_relation_joined,
+        )
+        framework.observe(
+            self.on[HAPROXY_ROUTE_RELATION].relation_changed,
+            self._on_haproxy_route_relation_joined,
+        )
+
+    @property
+    def unit_ip(self) -> str | None:
+        """Return the IP address bound to the haproxy-route endpoint."""
+        network_binding = self.model.get_binding(HAPROXY_ROUTE_RELATION)
+        if network_binding is None:
+            return None
+
+        try:
+            bind_address = network_binding.network.bind_address
+        except ModelError as e:
+            logger.warning(f"No bind address found for `{HAPROXY_ROUTE_RELATION}`: {e}")
+            return None
+
+        return str(bind_address) if bind_address else None
+
     def _on_install(self, event: ops.InstallEvent):
         """Install the workload on the machine."""
         debarchive.install()
@@ -51,7 +88,6 @@ class DebarchiveOperatorCharm(ops.CharmBase):
         version = debarchive.get_version()
         if version is not None:
             self.unit.set_workload_version(version)
-        self.unit.open_port("tcp", 8000)
         self.unit.status = ops.ActiveStatus()
 
     def _on_config_changed(self, event):
@@ -68,16 +104,13 @@ class DebarchiveOperatorCharm(ops.CharmBase):
             my_snap = cache["landscape-debarchive"]
 
             if my_snap.present:
-                my_snap.set({"deb.archive.server.port": str(port)})
-
-                for opened_port in self.unit.opened_ports():
-                    self.unit.close_port(opened_port.protocol, opened_port.port)
-
-                self.unit.open_port("tcp", int(port))
+                my_snap.set({"deb.archive.server.gateway-port": str(port)})
 
         except snap.SnapError:
             self.unit.status = ops.BlockedStatus("Failed to apply configuration")
             return
+
+        self._provide_haproxy_route_requirements()
 
         self.unit.status = ops.ActiveStatus()
 
@@ -106,6 +139,39 @@ class DebarchiveOperatorCharm(ops.CharmBase):
 
         self.unit.status = ops.ActiveStatus()
 
+    def _on_haproxy_route_relation_joined(
+        self, event: RelationJoinedEvent | RelationChangedEvent
+    ) -> None:
+        """Provide the haproxy-route requirements when the relation changes."""
+        if not self._provide_haproxy_route_requirements():
+            event.defer()
+
+    def _provide_haproxy_route_requirements(self) -> bool:
+        """Publish this unit's haproxy-route requirements to the related haproxy."""
+        if not self._stored.hostname:
+            return False
+
+        unit_ip = self.unit_ip
+        if not unit_ip:
+            return False
+
+        debarchive.set_host(unit_ip)
+        port = debarchive.get_port()
+
+        self.debarchive_haproxy_route.provide_haproxy_route_requirements(
+            service=f"landscape-debarchive-{self.model.uuid}",
+            ports=[port],
+            paths=[DEBARCHIVE_ROUTE_PREFIX],
+            protocol="http",
+            check_path=DEBARCHIVE_ROUTE_PREFIX,
+            path_rewrite_expressions=[DEBARCHIVE_PATH_REWRITE],
+            header_rewrite_expressions=[("X-Forwarded-Proto", "https")],
+            allow_http=True,
+            unit_address=unit_ip,
+            hostname=self._stored.hostname,
+        )
+        return True
+
     def _on_landscape_server_changed(self, event):
         """Store data published by the Landscape Server charm."""
         if event.app is None:
@@ -120,6 +186,7 @@ class DebarchiveOperatorCharm(ops.CharmBase):
         if hostname:
             self._stored.hostname = hostname
             logger.info("Stored Landscape hostname: %s", hostname)
+            self._provide_haproxy_route_requirements()
         else:
             logger.info("landscape-server has not published a hostname yet")
 

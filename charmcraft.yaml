@@ -10,10 +10,10 @@ description: |
 charm-libs:
   - lib: data_platform_libs.data_interfaces
     version: "0"
+  - lib: haproxy.haproxy_route
+    version: "1"
 
 platforms:
-  #ubuntu@22.04:amd64: TBD - Release for jammy as well?
-  #ubuntu@22.04:arm64:
   ubuntu@24.04:amd64:
   ubuntu@24.04:arm64:
 
@@ -31,6 +31,9 @@ parts:
 requires:
   database:
     interface: postgresql_client
+  debarchive-haproxy-route:
+    interface: haproxy-route
+    limit: 1
   landscape-server:
     interface: landscape-debarchive
     limit: 1
@@ -38,6 +41,6 @@ requires:
 config:
   options:
     server-port:
-      default: 8000
+      default: 8100
       type: int
       description: The port debarchive server will listen on.

@@ -38,9 +38,6 @@ def _install_snap_packages():
                 if "channel" in snap_version:
                     snap_package.ensure(snap.SnapState.Latest, channel=snap_version["channel"])
 
-            if snap_name == DEBARCHIVE_SNAP_NAME:
-                snap_package.set({"deb.archive.server.host": "0.0.0.0"})
-
             # TODO: if we want a specific revision of the snap (to match charm revisions to
             # snap revisions) handle here, then hold the package
         except (snap.SnapError, snap.SnapNotFoundError) as e:
@@ -99,3 +96,15 @@ def set_pagination_secret() -> None:
             "deb.archive.pagination.secret": pagination_secret,
         }
     )
+
+
+def set_host(host: str) -> None:
+    """Set the host for the debarchive server."""
+    debarchive_snap = snap.SnapCache()[DEBARCHIVE_SNAP_NAME]
+    debarchive_snap.set({"deb.archive.server.host": host})
+
+
+def get_port() -> int:
+    """Get the gateway port for the debarchive server."""
+    debarchive_snap = snap.SnapCache()[DEBARCHIVE_SNAP_NAME]
+    return int(debarchive_snap.get("deb.archive.server.gateway-port"))

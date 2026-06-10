@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 from charmlibs import snap
 from ops import testing
+from ops.model import ModelError
 
 import debarchive
 from charm import DebarchiveOperatorCharm
@@ -26,9 +27,8 @@ class TestCharmInstallAndStartup:
 
         mock_snap.ensure.assert_called_once_with(snap.SnapState.Latest, channel="beta")
 
-        # install() configures the host and then sets a generated pagination secret.
-        # The snap configure hook restarts the service for these config changes.
-        mock_snap.set.assert_any_call({"deb.archive.server.host": "0.0.0.0"})
+        # install() sets a generated pagination secret. The host is refreshed
+        # when haproxy route requirements are provided.
         pagination_call = next(
             call.args[0]
             for call in mock_snap.set.call_args_list
@@ -36,7 +36,7 @@ class TestCharmInstallAndStartup:
         )
         assert list(pagination_call) == ["deb.archive.pagination.secret"]
         assert pagination_call["deb.archive.pagination.secret"]
-        assert mock_snap.set.call_count == 2
+        assert mock_snap.set.call_count == 1
         mock_snap.restart.assert_not_called()
 
     def test_start(self, monkeypatch: pytest.MonkeyPatch):
@@ -52,8 +52,7 @@ class TestCharmInstallAndStartup:
         assert state_out.workload_version == "1.0.0"
         assert state_out.unit_status == testing.ActiveStatus()
 
-        opened_ports = {p.port for p in state_out.opened_ports}
-        assert 8000 in opened_ports
+        assert not state_out.opened_ports
 
     def test_start_no_version(self, monkeypatch: pytest.MonkeyPatch):
         """Test that the start hook handles a missing version gracefully."""
@@ -69,13 +68,12 @@ class TestCharmInstallAndStartup:
 
         assert state_out.unit_status == testing.ActiveStatus()
 
-        opened_ports = {p.port for p in state_out.opened_ports}
-        assert 8000 in opened_ports
+        assert not state_out.opened_ports
 
 
 class TestCharmConfigChanged:
     def test_config_changed_success(self, monkeypatch: pytest.MonkeyPatch):
-        """Test that changing the port config updates the snap and firewall correctly."""
+        """Test that changing the port config updates the snap."""
         ctx = testing.Context(DebarchiveOperatorCharm)
 
         mock_snap = MagicMock()
@@ -90,12 +88,11 @@ class TestCharmConfigChanged:
 
         state_out = ctx.run(ctx.on.config_changed(), state_in)
 
-        mock_snap.set.assert_called_once_with({"deb.archive.server.port": "8080"})
+        mock_snap.set.assert_called_once_with({"deb.archive.server.gateway-port": "8080"})
         mock_snap.restart.assert_not_called()
 
         opened_ports = {p.port for p in state_out.opened_ports}
-        assert 8080 in opened_ports
-        assert 8000 not in opened_ports
+        assert opened_ports == {8000}
 
         assert state_out.unit_status == testing.ActiveStatus()
 
@@ -113,7 +110,7 @@ class TestCharmConfigChanged:
         assert state_out.unit_status == testing.BlockedStatus("Failed to apply configuration")
 
     def test_config_changed_success_covers_ports(self, monkeypatch: pytest.MonkeyPatch):
-        """Test the 'happy path' where the snap is present and ports need closing."""
+        """Test the happy path leaves existing unit ports unchanged."""
         ctx = testing.Context(DebarchiveOperatorCharm)
 
         mock_snap = MagicMock()
@@ -129,12 +126,11 @@ class TestCharmConfigChanged:
 
         state_out = ctx.run(ctx.on.config_changed(), state_in)
 
-        mock_snap.set.assert_called_once_with({"deb.archive.server.port": "8080"})
+        mock_snap.set.assert_called_once_with({"deb.archive.server.gateway-port": "8080"})
         mock_snap.restart.assert_not_called()
 
         opened_ports = {p.port for p in state_out.opened_ports}
-        assert 8080 in opened_ports
-        assert 8000 not in opened_ports
+        assert opened_ports == {8000}
 
     def test_config_changed_snap_error_during_set(self, monkeypatch: pytest.MonkeyPatch):
         """Test simulating a failure while modifying the snap."""
@@ -207,7 +203,6 @@ class TestDebarchiveInstall:
         debarchive.install()
 
         assert mock_snap_inst.ensured is True
-        assert mock_snap_inst.set_called["deb.archive.server.host"] == "0.0.0.0"
         assert mock_snap_inst.set_called["deb.archive.pagination.secret"]
 
     def test_install_snap_packages_skips(self, monkeypatch: pytest.MonkeyPatch):
@@ -358,6 +353,31 @@ class TestDebarchiveConfig:
         assert config["deb.archive.pagination.secret"]
         mock_snap.restart.assert_not_called()
 
+    def test_set_host(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that set_host writes the debarchive server host."""
+        mock_snap = MagicMock()
+        mock_cache = MagicMock()
+        mock_cache.__getitem__.return_value = mock_snap
+        monkeypatch.setattr("debarchive.snap.SnapCache", lambda: mock_cache)
+
+        debarchive.set_host("10.1.2.3")
+
+        mock_cache.__getitem__.assert_called_once_with("landscape-debarchive")
+        mock_snap.set.assert_called_once_with({"deb.archive.server.host": "10.1.2.3"})
+        mock_snap.restart.assert_not_called()
+
+    def test_get_port(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that get_port reads and returns the configured snap port as an integer."""
+        mock_snap = MagicMock()
+        mock_snap.get.return_value = "8100"
+        mock_cache = MagicMock()
+        mock_cache.__getitem__.return_value = mock_snap
+        monkeypatch.setattr("debarchive.snap.SnapCache", lambda: mock_cache)
+
+        assert debarchive.get_port() == 8100
+        mock_cache.__getitem__.assert_called_once_with("landscape-debarchive")
+        mock_snap.get.assert_called_once_with("deb.archive.server.gateway-port")
+
 
 class TestDatabaseRelation:
     def test_database_created(self, monkeypatch: pytest.MonkeyPatch):
@@ -459,7 +479,11 @@ class TestLandscapeServerRelation:
         ctx = testing.Context(DebarchiveOperatorCharm)
 
         mock_set_secret = MagicMock()
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
         monkeypatch.setattr("charm.debarchive.set_secret_token", mock_set_secret)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
 
         secret = testing.Secret(tracked_content={"secret-token": "jwt-secret"})
         rel = testing.Relation(
@@ -478,6 +502,8 @@ class TestLandscapeServerRelation:
         assert stored.content["hostname"] == "landscape.example.com"
         assert stored.content["secret_token"] == "jwt-secret"
         mock_set_secret.assert_called_once_with({"secret-token": "jwt-secret"})
+        mock_set_host.assert_called_once_with("192.0.2.0")
+        mock_get_port.assert_called_once_with()
 
     def test_landscape_server_relation_no_app(self, monkeypatch: pytest.MonkeyPatch):
         """Test that nothing is stored when the relation-changed event has no remote app."""
@@ -556,7 +582,11 @@ class TestLandscapeServerRelation:
         ctx = testing.Context(DebarchiveOperatorCharm)
 
         mock_set_secret = MagicMock()
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
         monkeypatch.setattr("charm.debarchive.set_secret_token", mock_set_secret)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
 
         secret = testing.Secret(tracked_content={"secret-token": "jwt-secret"})
         rel = testing.Relation(
@@ -580,10 +610,17 @@ class TestLandscapeServerRelation:
         stored = state_out.get_stored_state("_stored", owner_path="DebarchiveOperatorCharm")
         assert stored.content["secret_token"] == "jwt-secret"
         mock_set_secret.assert_called_once_with({"secret-token": "jwt-secret"})
+        mock_set_host.assert_called_once_with("192.0.2.0")
+        mock_get_port.assert_called_once_with()
 
-    def test_landscape_server_relation_secret_not_found(self):
+    def test_landscape_server_relation_secret_not_found(self, monkeypatch: pytest.MonkeyPatch):
         """Test that the unit blocks when the advertised secret cannot be read."""
         ctx = testing.Context(DebarchiveOperatorCharm)
+
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
 
         rel = testing.Relation(
             endpoint="landscape-server",
@@ -598,13 +635,19 @@ class TestLandscapeServerRelation:
         state_out = ctx.run(ctx.on.relation_changed(rel), state_in)
 
         assert state_out.unit_status == testing.BlockedStatus("no secret token")
+        mock_set_host.assert_called_once_with("192.0.2.0")
+        mock_get_port.assert_called_once_with()
 
     def test_landscape_server_relation_secret_missing_token(self, monkeypatch: pytest.MonkeyPatch):
         """Test that a readable secret without secret-token blocks cleanly."""
         ctx = testing.Context(DebarchiveOperatorCharm)
 
         mock_set_secret = MagicMock()
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
         monkeypatch.setattr("charm.debarchive.set_secret_token", mock_set_secret)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
 
         secret = testing.Secret(tracked_content={"other-key": "jwt-secret"})
         rel = testing.Relation(
@@ -621,6 +664,8 @@ class TestLandscapeServerRelation:
 
         assert state_out.unit_status == testing.BlockedStatus("no secret token")
         mock_set_secret.assert_not_called()
+        mock_set_host.assert_called_once_with("192.0.2.0")
+        mock_get_port.assert_called_once_with()
 
     def test_landscape_server_relation_configure_secret_failure(
         self, monkeypatch: pytest.MonkeyPatch
@@ -632,6 +677,10 @@ class TestLandscapeServerRelation:
             "charm.debarchive.set_secret_token",
             MagicMock(side_effect=snap.SnapError("snapd unavailable")),
         )
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
 
         secret = testing.Secret(tracked_content={"secret-token": "jwt-secret"})
         rel = testing.Relation(
@@ -649,3 +698,134 @@ class TestLandscapeServerRelation:
         assert state_out.unit_status == testing.BlockedStatus("Failed to configure secret token")
         stored = state_out.get_stored_state("_stored", owner_path="DebarchiveOperatorCharm")
         assert stored.content["secret_token"] is None
+        mock_set_host.assert_called_once_with("192.0.2.0")
+        mock_get_port.assert_called_once_with()
+
+
+class TestHaproxyRouteRelation:
+    def test_relation_joined_defers_without_landscape_hostname(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test that joining the haproxy-route relation defers without a Landscape hostname."""
+        ctx = testing.Context(DebarchiveOperatorCharm)
+
+        provide = MagicMock()
+        monkeypatch.setattr(
+            "charm.HaproxyRouteRequirer.provide_haproxy_route_requirements", provide
+        )
+
+        haproxy_rel = testing.Relation(
+            endpoint="debarchive-haproxy-route", interface="haproxy-route"
+        )
+        network = testing.Network(
+            "debarchive-haproxy-route",
+            bind_addresses=[testing.BindAddress([testing.Address("10.1.2.3")])],
+        )
+        state_in = testing.State(relations=[haproxy_rel], networks={network})
+
+        state_out = ctx.run(ctx.on.relation_joined(haproxy_rel), state_in)
+
+        assert len(state_out.deferred) == 1
+        provide.assert_not_called()
+
+    def test_relation_uses_landscape_hostname(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that the haproxy-route relation uses the Landscape hostname when available."""
+        ctx = testing.Context(DebarchiveOperatorCharm)
+        mock_set_host = MagicMock()
+        mock_get_port = MagicMock(return_value=8100)
+        monkeypatch.setattr("charm.debarchive.set_host", mock_set_host)
+        monkeypatch.setattr("charm.debarchive.get_port", mock_get_port)
+
+        captured = {}
+
+        def fake_provide(self, **kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(
+            "charm.HaproxyRouteRequirer.provide_haproxy_route_requirements", fake_provide
+        )
+
+        haproxy_rel = testing.Relation(
+            endpoint="debarchive-haproxy-route", interface="haproxy-route"
+        )
+        network = testing.Network(
+            "debarchive-haproxy-route",
+            bind_addresses=[testing.BindAddress([testing.Address("10.1.2.3")])],
+        )
+        stored = testing.StoredState(
+            owner_path="DebarchiveOperatorCharm",
+            name="_stored",
+            content={"hostname": "landscape.example.com", "secret_token": None},
+        )
+        state_in = testing.State(
+            relations=[haproxy_rel], networks={network}, stored_states=[stored]
+        )
+
+        ctx.run(ctx.on.relation_joined(haproxy_rel), state_in)
+
+        assert captured["unit_address"] == "10.1.2.3"
+        assert captured["hostname"] == "landscape.example.com"
+        assert captured["ports"] == [8100]
+        assert captured["paths"] == ["/debarchive"]
+        assert captured["path_rewrite_expressions"] == [r"%[path,regsub(^/debarchive/?,/)]"]
+        assert captured["service"].startswith("landscape-debarchive-")
+        mock_set_host.assert_called_once_with("10.1.2.3")
+        mock_get_port.assert_called_once_with()
+
+    def test_unit_ip_no_binding(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that unit_ip is None and the route is not published without a binding."""
+        ctx = testing.Context(DebarchiveOperatorCharm)
+
+        with ctx(ctx.on.start(), testing.State()) as manager:
+            manager.run()
+            charm = manager.charm
+            monkeypatch.setattr(charm.model, "get_binding", lambda name: None)
+            provide = MagicMock()
+            monkeypatch.setattr(
+                charm.debarchive_haproxy_route, "provide_haproxy_route_requirements", provide
+            )
+
+            assert charm.unit_ip is None
+
+            charm._provide_haproxy_route_requirements()
+            provide.assert_not_called()
+
+    def test_route_not_published_without_unit_ip(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that route requirements are not published without a unit IP."""
+        ctx = testing.Context(DebarchiveOperatorCharm)
+        stored = testing.StoredState(
+            owner_path="DebarchiveOperatorCharm",
+            name="_stored",
+            content={"hostname": "landscape.example.com", "secret_token": None},
+        )
+
+        with ctx(ctx.on.start(), testing.State(stored_states=[stored])) as manager:
+            manager.run()
+            charm = manager.charm
+            monkeypatch.setattr(charm.model, "get_binding", lambda name: None)
+            provide = MagicMock()
+            monkeypatch.setattr(
+                charm.debarchive_haproxy_route, "provide_haproxy_route_requirements", provide
+            )
+
+            assert charm._provide_haproxy_route_requirements() is False
+            provide.assert_not_called()
+
+    def test_unit_ip_model_error(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that unit_ip returns None when reading the bind address raises ModelError."""
+        ctx = testing.Context(DebarchiveOperatorCharm)
+
+        class FakeNetwork:
+            @property
+            def bind_address(self):
+                raise ModelError("no bind address")
+
+        class FakeBinding:
+            network = FakeNetwork()
+
+        with ctx(ctx.on.start(), testing.State()) as manager:
+            manager.run()
+            charm = manager.charm
+            monkeypatch.setattr(charm.model, "get_binding", lambda name: FakeBinding())
+
+            assert charm.unit_ip is None
