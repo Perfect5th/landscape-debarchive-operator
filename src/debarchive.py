@@ -5,6 +5,7 @@ The intention is that this module could be used outside the context of a charm.
 
 import base64
 import logging
+import platform
 import secrets
 from typing import Any
 
@@ -12,11 +13,43 @@ from charmlibs import snap
 
 logger = logging.getLogger(__name__)
 
+AMD64 = "amd64"
+ARM64 = "arm64"
 DEBARCHIVE_SNAP_NAME = "landscape-debarchive"
 DEBARCHIVE_SERVICE_NAME = "debarchive"
-SNAPS_TO_INSTALL = [(DEBARCHIVE_SNAP_NAME, {"channel": "beta"})]
+DEBARCHIVE_SNAP_CHANNEL = "edge"
+# The snap is built per architecture, so each architecture has its own revision.
+DEBARCHIVE_SNAP_REVISIONS = {
+    AMD64: "258",
+    ARM64: "259",
+}
+# Map the values reported by platform.machine() to Juju/snap architecture names.
+_ARCHITECTURE_ALIASES = {
+    "x86_64": AMD64,
+    "amd64": AMD64,
+    "aarch64": ARM64,
+    "arm64": ARM64,
+}
 LOG_LEVELS = ("debug", "warn", "error", "info", "trace", "fatal")
 SENSITIVE_CONFIG_FIELDS = frozenset({"password", "secret"})
+
+
+def get_architecture() -> str:
+    """Return the normalized architecture name (e.g. amd64 or arm64)."""
+    machine = platform.machine().lower()
+    architecture = _ARCHITECTURE_ALIASES.get(machine)
+    if architecture is None:
+        raise ValueError(f"Unsupported architecture: {machine}")
+    return architecture
+
+
+def _snaps_to_install() -> list[tuple[str, dict[str, str]]]:
+    """Build the list of snaps to install, pinned to this architecture's revision."""
+    revision = DEBARCHIVE_SNAP_REVISIONS[get_architecture()]
+    return [(DEBARCHIVE_SNAP_NAME, {"channel": DEBARCHIVE_SNAP_CHANNEL, "revision": revision})]
+
+
+SNAPS_TO_INSTALL = _snaps_to_install()
 
 
 def install() -> None:
@@ -25,25 +58,47 @@ def install() -> None:
     set_pagination_secret()
 
 
+def refresh() -> None:
+    """Refresh the debarchive snaps to the revision pinned by the charm.
+
+    Called on charm upgrade so that a snap refresh accompanies the charm refresh.
+    """
+    _install_snap_packages(refresh=True)
+
+
 def start() -> None:
     """Start the workload (by running a commamd, for example)."""
     # You'll need to implement this function.
     # Ideally, this function should only return once the workload is ready to use.
 
 
-def _install_snap_packages():
-    """Install snaps required for debarchive."""
+def _install_snap_packages(refresh: bool = False) -> None:
+    """Install (or refresh) snaps required for debarchive.
+
+    When `refresh` is True, snaps that are already present are ensured to be at
+    the pinned revision so that holds are re-applied after moving to a new
+    revision.
+    """
     for snap_name, snap_version in SNAPS_TO_INSTALL:
         try:
             snap_cache = snap.SnapCache()
             snap_package = snap_cache[snap_name]
 
-            if not snap_package.present:
-                if "channel" in snap_version:
-                    snap_package.ensure(snap.SnapState.Latest, channel=snap_version["channel"])
+            if ("channel" in snap_version or "revision" in snap_version) and (
+                not snap_package.present or refresh
+            ):
+                if refresh and snap_package.held:
+                    snap_package.unhold()
+                snap_package.ensure(
+                    snap.SnapState.Latest,
+                    channel=snap_version.get("channel", ""),
+                    revision=snap_version.get("revision"),
+                )
 
-            # TODO: if we want a specific revision of the snap (to match charm revisions to
-            # snap revisions) handle here, then hold the package
+            # Pin the snap to a specific revision (to match charm revisions to snap
+            # revisions) by holding it so it is not refreshed automatically.
+            if "revision" in snap_version:
+                snap_package.hold()
         except (snap.SnapError, snap.SnapNotFoundError) as e:
             logger.error("An exception occurred when installing %s. Reason: %s", snap_name, str(e))
             raise
